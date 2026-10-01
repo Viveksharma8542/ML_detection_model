@@ -1,0 +1,4 @@
+#Tue Sep 29 04:58:26 IST 2026
+base.0=F\:\\coding\\opencv\\PotholeApp\\app\\build\\intermediates\\dex\\debugAndroidTest\\mergeProjectDexDebugAndroidTest\\0\\classes.dex
+path.0=0/classes.dex
+renamed.0=classes.dex

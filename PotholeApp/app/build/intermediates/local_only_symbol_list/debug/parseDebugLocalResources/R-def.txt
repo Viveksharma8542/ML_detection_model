@@ -1,0 +1,8 @@
+R_DEF: Internal format may change without notice
+local
+id overlayView
+id previewView
+id statsText
+layout activity_main
+string app_name
+style Theme.PotholeApp

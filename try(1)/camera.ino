@@ -1,10 +1,9 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include "esp_http_server.h"
-#include "img_converters.h"
 
-const char* ssid     = "RBCET LAB";
-const char* password = "";
+const char* ssid     = "AdvRohitSharma";
+const char* password = "Advocate@2023";
 
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -26,10 +25,8 @@ const char* password = "";
 httpd_handle_t stream_httpd = NULL;
 
 // ============================================================
-// SPEED SETTINGS
-//   VGA (640x480) = 614 KB per raw frame  -> best detection range
-//   QVGA (320x240) = 154 KB per raw frame -> 4x faster WiFi transfer
-// For maximum speed set: CAM_FRAMESIZE FRAMESIZE_QVGA, 320, 240
+// SETTINGS — JPEG QVGA: small frames, smooth WiFi
+// For more detail (slower): FRAMESIZE_VGA, 640, 480
 // ============================================================
 #define CAM_FRAMESIZE FRAMESIZE_QVGA
 #define FRAME_WIDTH   320
@@ -43,7 +40,7 @@ static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 
 // ============================================================
 // STREAM HANDLER
-// JPEG via fmt2jpg for browser viewing (sensor already JPEG)
+// JPEG multipart stream for browser viewing
 // ============================================================
 
 static esp_err_t stream_handler(httpd_req_t *req) {
@@ -65,41 +62,18 @@ static esp_err_t stream_handler(httpd_req_t *req) {
       break;
     }
 
-      // If sensor already JPEG, send directly; else convert
-    uint8_t *jpg_buf = NULL;
-    size_t jpg_len = 0;
-    bool need_free = false;
-
-    if (fb->format == PIXFORMAT_JPEG) {
-      jpg_buf = fb->buf;
-      jpg_len = fb->len;
-      need_free = false;
-    } else {
-      bool converted = fmt2jpg(
-        fb->buf, fb->len, fb->width, fb->height,
-        PIXFORMAT_RGB565, 12, &jpg_buf, &jpg_len
-      );
-      if (!converted || !jpg_buf) {
-        Serial.println("JPEG conversion failed");
-        esp_camera_fb_return(fb);
-        res = ESP_FAIL;
-        break;
-      }
-      need_free = true;
-    }
-
+    // Sensor outputs JPEG — send frame directly, no conversion
     if (res == ESP_OK) {
       res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
     }
     if (res == ESP_OK) {
-      size_t hlen = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, jpg_len);
+      size_t hlen = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, fb->len);
       res = httpd_resp_send_chunk(req, part_buf, hlen);
     }
     if (res == ESP_OK) {
-      res = httpd_resp_send_chunk(req, (const char *)jpg_buf, jpg_len);
+      res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
     }
 
-    if (need_free) free(jpg_buf);
     esp_camera_fb_return(fb);
 
     if (res != ESP_OK) break;
@@ -156,7 +130,7 @@ static esp_err_t bench_handler(httpd_req_t *req) {
     "\"psram_total_bytes\": %u,"
     "\"camera_format\": \"JPEG\","
     "\"frame_size\": \"%s\","
-    "\"raw_frame_bytes\": %u,"
+    "\"jpeg_quality\": 12,"
     "\"resolution\": \"%dx%d\""
     "}",
     ESP.getFreeHeap(),
@@ -164,7 +138,6 @@ static esp_err_t bench_handler(httpd_req_t *req) {
     ESP.getFreePsram(),
     ESP.getPsramSize(),
     CAM_FRAMESIZE == FRAMESIZE_QVGA ? "QVGA" : "VGA",
-    0,
     FRAME_WIDTH,
     FRAME_HEIGHT
   );
@@ -186,7 +159,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
     "<html><head><title>ESP32-CAM PathIQ</title></head>"
     "<body style='text-align:center;font-family:sans-serif;background:#111;color:#fff;padding:40px;'>"
     "<h2>ESP32-CAM PathIQ AI Detection</h2>"
-    "<p>Camera: <b>JPEG VGA</b> — Good quality</p>"
+    "<p>Camera: <b>JPEG QVGA 320x240</b> — Smooth stream</p>"
     "<br>"
     "<p><a href='/stream' style='color:#2A9D8F;font-size:18px;'>Live JPEG Stream</a></p>"
     "<p><a href='/capture' style='color:#E76F51;font-size:18px;'>Capture (JPEG)</a></p>"
@@ -254,8 +227,7 @@ void setup() {
 
   config.xclk_freq_hz = 20000000;
 
-  // JPEG at VGA — reliable WiFi, good quality
-  // Browser /stream and Python /capture both JPEG
+  // JPEG QVGA — small frames, smooth WiFi
 
   if (psramFound()) {
     config.pixel_format = PIXFORMAT_JPEG;
@@ -265,14 +237,14 @@ void setup() {
     config.fb_location  = CAMERA_FB_IN_PSRAM;
     Serial.println("PSRAM Found — Using JPEG capture");
     Serial.printf("PSRAM Size: %d MB\n", ESP.getPsramSize() / (1024 * 1024));
-    Serial.printf("JPEG frame @VGA quality 12\n");
+    Serial.printf("JPEG frame %dx%d quality 12\n", FRAME_WIDTH, FRAME_HEIGHT);
   } else {
-    // Fallback: no PSRAM = cannot hold RGB565 at VGA
+    // Fallback: no PSRAM = single small buffer
     config.pixel_format = PIXFORMAT_JPEG;
     config.frame_size   = FRAMESIZE_QVGA;
     config.fb_count     = 1;
     config.grab_mode    = CAMERA_GRAB_LATEST;
-    Serial.println("PSRAM NOT Found — Falling back to JPEG");
+    Serial.println("PSRAM NOT Found — single frame buffer");
   }
 
   esp_err_t err = esp_camera_init(&config);
@@ -299,19 +271,14 @@ void setup() {
     s->set_vflip(s, 0);
   }
 
-  WiFi.begin(ssid, password);
+  // AP MODE — ESP32 is its own hotspot, bypasses router isolation
+  WiFi.softAP("ESP32CAM", "12345678");
   WiFi.setSleep(false);
 
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
   Serial.println("");
-  Serial.println("WiFi connected!");
-
+  Serial.println("AP started!");
   Serial.print("Camera Ready! Open: http://");
-  Serial.println(WiFi.localIP());
+  Serial.println(WiFi.softAPIP());  // usually 192.168.4.1
 
   startCameraServer();
 }

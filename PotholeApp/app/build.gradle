@@ -1,0 +1,52 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.pothole.detector'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.pothole.detector'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+    // ONNX model (~10 MB) must not be compressed in the APK
+    aaptOptions {
+        noCompress 'onnx'
+    }
+}
+
+dependencies {
+    // CameraX 1.3.4 (verified on Maven)
+    implementation 'androidx.camera:camera-core:1.3.4'
+    implementation 'androidx.camera:camera-camera2:1.3.4'
+    implementation 'androidx.camera:camera-lifecycle:1.3.4'
+    implementation 'androidx.camera:camera-view:1.3.4'
+
+    // ONNX Runtime for Android (runs best.onnx, YOLO11n 160x160)
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.20.0'
+
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
+
+    // GPS coordinates for detections
+    implementation 'com.google.android.gms:play-services-location:21.3.0'
+}

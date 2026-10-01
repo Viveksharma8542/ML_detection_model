@@ -5,7 +5,6 @@ import threading
 import socket
 import select
 import numpy as np
-import json
 import tracemalloc
 import psutil
 from ultralytics import YOLO
@@ -15,11 +14,9 @@ from ultralytics import YOLO
 # SETTINGS
 # ============================================================
 
-MODEL_PATH = "best (1).onnx"  # run export_onnx.py first; falls back to .pt
-STREAM_URL = "http://172.16.6.78/stream"
-ESP32_IP = "172.16.10.109"
+MODEL_PATH = "best (1).onnx"  # auto-uses OpenVINO folder if present, else .pt
+STREAM_URL = "http://192.168.4.1/stream"
 
-FORCE_RAW_MODE = False
 CONF_THRESHOLD = 0.65
 INFER_SIZE = 160
 MAX_DET = 10
@@ -27,239 +24,6 @@ MAX_DET = 10
 ESP8266_IP = "172.16.10.80"
 UDP_PORT = 4210
 UDP_COOLDOWN = 5.0
-
-
-# ============================================================
-# BENCH MONITOR — queries ESP32 /bench for memory stats
-# ============================================================
-
-class BenchMonitor:
-
-    def __init__(self, esp32_ip):
-        self.esp32_ip = esp32_ip
-        self.stats = {}
-        for attempt in range(1, 4):
-            print(f"[BENCH] Attempt {attempt}/3 — querying ESP32...")
-            self._fetch()
-            if self.stats:
-                break
-            time.sleep(2)
-
-    def _fetch(self):
-        try:
-            sock = socket.socket(
-                socket.AF_INET,
-                socket.SOCK_STREAM
-            )
-            sock.settimeout(5)
-            sock.connect((self.esp32_ip, 80))
-
-            req = (
-                f"GET /bench HTTP/1.1\r\n"
-                f"Host: {self.esp32_ip}\r\n"
-                f"Connection: close\r\n"
-                f"\r\n"
-            )
-            sock.sendall(req.encode())
-
-            data = b""
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-            sock.close()
-
-            body_start = data.find(b"\r\n\r\n")
-            if body_start == -1:
-                return
-            body = data[body_start + 4:]
-            self.stats = json.loads(body.decode().strip())
-
-        except Exception as e:
-            print(f"[BENCH] ESP32 unreachable: {e}")
-
-    def is_raw(self):
-        return self.stats.get("camera_format") == "RGB565"
-
-    def print_stats(self):
-        if not self.stats:
-            print("[BENCH] No ESP32 data")
-            return
-        heap = self.stats.get("heap_free_bytes", 0)
-        psram = self.stats.get("psram_free_bytes", 0)
-        raw_bytes = self.stats.get("raw_frame_bytes", 0)
-        fmt = self.stats.get("camera_format", "?")
-        res = self.stats.get("resolution", "?")
-        print(f"  Format     : {fmt}")
-        print(f"  Resolution : {res}")
-        print(f"  Heap Free  : {heap / 1024:.1f} KB")
-        print(f"  PSRAM Free : {psram / 1024:.1f} KB")
-        print(f"  Raw Frame  : {raw_bytes / 1024:.1f} KB")
-
-
-# ============================================================
-# RAW FRAME READER — captures RGB565 directly from /capture
-# No JPEG encode on ESP32, no JPEG decode on Python
-# ============================================================
-
-class RawFrameReader:
-
-    def __init__(self, esp32_ip):
-        self.esp32_ip = esp32_ip
-
-    def capture(self):
-        """Capture one raw RGB565 frame.
-        Returns numpy BGR array or None.
-        Opens a fresh connection each time — most reliable."""
-
-        sock = None
-        try:
-            sock = socket.socket(
-                socket.AF_INET,
-                socket.SOCK_STREAM
-            )
-            sock.settimeout(30)
-            sock.connect((self.esp32_ip, 80))
-
-            req = (
-                f"GET /capture HTTP/1.1\r\n"
-                f"Host: {self.esp32_ip}\r\n"
-                f"Connection: close\r\n"
-                f"\r\n"
-            )
-            sock.sendall(req.encode())
-
-            # Read headers + keep any body bytes in same chunks
-            buf = b""
-            while b"\r\n\r\n" not in buf:
-                chunk = sock.recv(8192)
-                if not chunk:
-                    raise ConnectionError("Header read failed")
-                buf += chunk
-
-            sep = buf.find(b"\r\n\r\n")
-            header_str = buf[:sep].decode(errors="ignore")
-            body = bytearray(buf[sep + 4:])
-
-            content_length = 0
-            width = 160
-            height = 120
-            chunked = False
-
-            for line in header_str.split("\r\n"):
-                lower = line.lower().strip()
-                if lower.startswith("transfer-encoding:") and "chunked" in lower:
-                    chunked = True
-                elif lower.startswith("content-length:"):
-                    content_length = int(
-                        line.split(":", 1)[1].strip()
-                    )
-                elif lower.startswith("x-frame-width:"):
-                    width = int(
-                        line.split(":", 1)[1].strip()
-                    )
-                elif lower.startswith("x-frame-height:"):
-                    height = int(
-                        line.split(":", 1)[1].strip()
-                    )
-
-            print(
-                f"[RAW] Headers: CL={content_length} "
-                f"W={width} H={height} chunked={chunked}"
-            )
-
-            # ---- Read body: handles chunked, CL, or EOF modes ----
-            def dechunk(src):
-                out = bytearray()
-                i = 0
-                while True:
-                    j = src.find(b"\r\n", i)
-                    if j == -1:
-                        return None
-                    try:
-                        size = int(src[i:j].split(b";")[0], 16)
-                    except ValueError:
-                        return None
-                    i = j + 2
-                    if size == 0:
-                        return bytes(out)
-                    end = i + size + 2
-                    if len(src) < end:
-                        return None
-                    out += src[i:i + size]
-                    i = end
-
-            data = None
-            while data is None:
-                if chunked:
-                    data = dechunk(body)
-                    if data is not None:
-                        break
-                elif content_length and len(body) >= content_length:
-                    data = bytes(body[:content_length])
-                    break
-
-                chunk = sock.recv(65536)
-                if not chunk:
-                    if chunked:
-                        raise ConnectionError(
-                            f"Chunked incomplete: {len(body)}"
-                        )
-                    data = bytes(body)  # EOF-delimited
-                    break
-                body += chunk
-
-            total = len(data)
-            print(f"[RAW] Received {total} bytes")
-
-            if total == 0:
-                raise ConnectionError("Empty body")
-
-            # Self-correct dims if header values are wrong
-            if width * height * 2 != total:
-                px_total = total // 2
-                if px_total % width == 0:
-                    height = px_total // width
-                elif px_total % height == 0:
-                    width = px_total // height
-                print(
-                    f"[RAW] Dim mismatch — corrected to "
-                    f"{width}x{height}"
-                )
-
-            # Reshape — zero-copy, NO jpeg decode
-            # RGB565: 2 bytes/pixel, 16-bit little-endian words
-            px = np.frombuffer(
-                data, dtype="<u2"
-            ).reshape(height, width)
-
-            # RGB565 -> BGR for YOLO (expects OpenCV BGR)
-            frame_bgr = np.stack([
-                ((px >> 11) & 0x1F) << 3,
-                ((px >> 5) & 0x3F) << 2,
-                (px & 0x1F) << 3,
-            ], axis=-1).astype(np.uint8)
-
-            return frame_bgr
-
-        except Exception as e:
-            print(f"[RAW] Error: {e}")
-            return None
-        finally:
-            if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-
-    def close(self):
-        if self._sock:
-            try:
-                self._sock.close()
-            except Exception:
-                pass
-            self._sock = None
 
 
 # ============================================================
@@ -309,7 +73,7 @@ class UdpNotifier:
 
 class AsyncDetector:
 
-    def __init__(self, model_path, stream_url, raw_mode=False):
+    def __init__(self, model_path, stream_url):
 
         print("Loading model...")
 
@@ -326,10 +90,6 @@ class AsyncDetector:
                 self.device = "cpu"
         except ImportError:
             self.device = "cpu"
-
-        self.half = self.device == "cuda"
-        if self.half:
-            print("[SPEED] FP16 half-precision inference ENABLED")
 
         print(f"Using device: {self.device}")
 
@@ -349,26 +109,18 @@ class AsyncDetector:
         self._model_ram_mb = peak / (1024 * 1024)
         print(f"[RAM] Model loaded — Peak: {self._model_ram_mb:.2f} MB")
 
-        self.raw_mode = raw_mode
         self.stream_url = stream_url
-        self._raw_reader = None
         self._sock = None
         self._buffer = b""
         self._decoded = b""
 
-        if self.raw_mode:
-            ip = stream_url.split("/")[2].split(":")[0]
-            print("[MODE] RAW RGB565 — JPEG encode/decode ELIMINATED")
-            self._raw_reader = RawFrameReader(ip)
-        else:
-            print("[MODE] JPEG stream — traditional decode path")
-            self._connect()
+        print("[MODE] JPEG stream")
+        self._connect()
 
         print("Stream Connected Successfully")
 
         # Timing
         self._read_ms = 0.0
-        self._network_ms = 0.0
         self._decode_ms = 0.0
         self._pre_ms = 0.0
         self._inf_ms = 0.0
@@ -392,11 +144,10 @@ class AsyncDetector:
         self._stop = False
 
         # Threads
-        if not self.raw_mode:
-            self._reader_thread = threading.Thread(
-                target=self._read_loop, daemon=True
-            )
-            self._reader_thread.start()
+        self._reader_thread = threading.Thread(
+            target=self._read_loop, daemon=True
+        )
+        self._reader_thread.start()
 
         self._infer_thread = threading.Thread(
             target=self._infer_loop, daemon=True
@@ -428,7 +179,7 @@ class AsyncDetector:
 
 
     # ========================================================
-    # CONNECT (JPEG mode only)
+    # CONNECT
     # ========================================================
 
     def _connect(self):
@@ -455,7 +206,7 @@ class AsyncDetector:
 
 
     # ========================================================
-    # CAMERA READER THREAD (JPEG mode only)
+    # CAMERA READER THREAD
     # ========================================================
 
     def _read_loop(self):
@@ -580,44 +331,20 @@ class AsyncDetector:
 
             frame = None
 
-            if self.raw_mode:
-                # ============================================
-                # RAW MODE — capture directly, zero decode
-                # ============================================
-                net_start = time.perf_counter()
-                frame = self._raw_reader.capture()
-                net_ms = (time.perf_counter() - net_start) * 1000
+            with self._lock:
+                fid = self._latest_frame_id
+                if (
+                    fid == last_processed_id
+                    or self._latest_frame is None
+                ):
+                    frame = None
+                else:
+                    frame = self._latest_frame.copy()
+                    last_processed_id = fid
 
-                if frame is None:
-                    time.sleep(0.01)
-                    continue
-
-                with self._lock:
-                    self._network_ms = net_ms
-                    self._decode_ms = 0.0
-                    self._read_ms = 0.0
-                    self._frame_id += 1
-                    self._latest_frame = frame
-                    self._latest_frame_id = self._frame_id
-
-            else:
-                # ============================================
-                # JPEG MODE — get from reader thread
-                # ============================================
-                with self._lock:
-                    fid = self._latest_frame_id
-                    if (
-                        fid == last_processed_id
-                        or self._latest_frame is None
-                    ):
-                        frame = None
-                    else:
-                        frame = self._latest_frame.copy()
-                        last_processed_id = fid
-
-                if frame is None:
-                    time.sleep(0.003)
-                    continue
+            if frame is None:
+                time.sleep(0.003)
+                continue
 
             # ============================================
             # YOLO INFERENCE
@@ -695,7 +422,6 @@ class AsyncDetector:
                 self._camera_fps,
                 self._inference_fps,
                 self._read_ms,
-                self._network_ms,
                 self._decode_ms,
                 self._pre_ms,
                 self._inf_ms,
@@ -719,8 +445,7 @@ class AsyncDetector:
 
     def release(self):
         self._stop = True
-        if not self.raw_mode:
-            self._reader_thread.join(timeout=4)
+        self._reader_thread.join(timeout=4)
         self._infer_thread.join(timeout=4)
 
 
@@ -759,26 +484,7 @@ def draw_boxes(frame, boxes, pothole_active):
 
 def main():
 
-    # --------------------------------------------------------
-    # Detect ESP32 camera format
-    # --------------------------------------------------------
-
-    if FORCE_RAW_MODE:
-        raw_mode = True
-        bench = None
-    else:
-        raw_mode = False
-        bench = None
-
-    # --------------------------------------------------------
-    # Init detector
-    # --------------------------------------------------------
-
-    detector = AsyncDetector(
-        MODEL_PATH,
-        STREAM_URL,
-        raw_mode=raw_mode
-    )
+    detector = AsyncDetector(MODEL_PATH, STREAM_URL)
 
     notifier = UdpNotifier(ESP8266_IP, UDP_PORT)
 
@@ -790,7 +496,6 @@ def main():
 
     camera_fps_hist = []
     inference_fps_hist = []
-    network_hist = []
     read_hist = []
     decode_hist = []
     pre_hist = []
@@ -814,7 +519,6 @@ def main():
                 camera_fps,
                 inference_fps,
                 read_ms,
-                network_ms,
                 decode_ms,
                 pre_ms,
                 inf_ms,
@@ -833,7 +537,6 @@ def main():
                 camera_fps_hist.append(camera_fps)
             if inference_fps > 0:
                 inference_fps_hist.append(inference_fps)
-            network_hist.append(network_ms)
             read_hist.append(read_ms)
             decode_hist.append(decode_ms)
             pre_hist.append(pre_ms)
@@ -844,7 +547,7 @@ def main():
             # Trim
             for h in [
                 camera_fps_hist, inference_fps_hist,
-                network_hist, read_hist, decode_hist,
+                read_hist, decode_hist,
                 pre_hist, inf_hist, post_hist, total_hist
             ]:
                 if len(h) > max_samples:
@@ -856,7 +559,6 @@ def main():
 
             avg_cam = avg(camera_fps_hist)
             avg_inf_fps = avg(inference_fps_hist)
-            avg_net = avg(network_hist)
             avg_read = avg(read_hist)
             avg_dec = avg(decode_hist)
             avg_pre = avg(pre_hist)
@@ -890,10 +592,8 @@ def main():
         print()
 
         print("  [CAMERA]")
-        if bench:
-            bench.print_stats()
-        else:
-            print("  (bench skipped — FORCE_RAW_MODE)")
+        print(f"  Stream URL      : {STREAM_URL}")
+        print(f"  Camera FPS (avg): {avg(camera_fps_hist):.2f}" if camera_fps_hist else "  Camera FPS      : n/a")
         print()
 
         print("  [PYTHON MEMORY]")
@@ -910,12 +610,8 @@ def main():
         print()
 
         print("  [LATENCY BREAKDOWN]")
-        if raw_mode:
-            print(f"  Network Read        : {avg(network_hist):.2f} ms")
-            print(f"  JPEG Decode         : 0.00 ms  (ELIMINATED)")
-        else:
-            if read_hist:
-                print(f"  JPEG Decode (avg)   : {avg(read_hist):.2f} ms")
+        if read_hist:
+            print(f"  JPEG Decode (avg)   : {avg(read_hist):.2f} ms")
         if pre_hist:
             print(f"  Preprocess (avg)    : {avg(pre_hist):.2f} ms")
         if inf_hist:
@@ -932,8 +628,6 @@ def main():
 
         print("  [BOTTLENECK]")
         stages = {}
-        if network_hist:
-            stages["Network Read"] = avg(network_hist)
         if decode_hist:
             stages["JPEG Decode"] = avg(decode_hist)
         if pre_hist:
@@ -946,10 +640,6 @@ def main():
         if stages:
             bottleneck = max(stages, key=stages.get)
             print(f"  Biggest bottleneck   : {bottleneck} ({stages[bottleneck]:.2f} ms)")
-
-        if raw_mode and decode_hist:
-            saved = sum(decode_hist) / len(decode_hist) if decode_hist else 0
-            print(f"  JPEG decode saved   : ~{saved:.2f} ms per frame")
 
         print()
         print("=" * 55)
